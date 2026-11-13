@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app import db, service
 from app.config import Settings
@@ -253,6 +255,149 @@ class CleanupServiceTests(unittest.TestCase):
         self.assertEqual(second["deleted"], [])
         self.assertEqual(second["already_absent"], ["a.parquet"])
         self.assertEqual(second["failed"], [])
+
+    def test_register_returns_while_cleanup_is_stuck_deleting(self) -> None:
+        """A slow unlink must not block registration for a retained snapshot.
+
+        The registry still points at a retained snapshot, so the exporter
+        must get its receipt and its files must remain protected even though
+        cleanup is in the middle of its filesystem phase.
+        """
+
+        self.write_manifest(
+            [
+                {"snapshot_id": "retired", "files": ["old.parquet"]},
+                {"snapshot_id": "retained", "files": ["kept.parquet", "shared.parquet"]},
+            ]
+        )
+        self.touch("old.parquet", "kept.parquet", "shared.parquet")
+        service.retire_snapshot(self.settings(), "retired")
+
+        unlink_started = threading.Event()
+        release_unlink = threading.Event()
+        original_delete = service._delete_file
+
+        def slow_delete(data_dir: Path, relative_path: str) -> str:
+            unlink_started.set()
+            # Simulate a filesystem that takes a long time to delete.
+            release_unlink.wait(timeout=15)
+            return original_delete(data_dir, relative_path)
+
+        cleanup_outcome: dict[str, object] = {}
+
+        def do_cleanup() -> None:
+            cleanup_outcome["result"] = service.run_cleanup(self.settings())
+
+        with mock.patch.object(service, "_delete_file", slow_delete):
+            cleanup_thread = threading.Thread(target=do_cleanup)
+            cleanup_thread.start()
+            self.assertTrue(unlink_started.wait(timeout=10))
+
+            registration_outcome: dict[str, object] = {}
+            elapsed: dict[str, float] = {}
+
+            def do_register() -> None:
+                started = time.monotonic()
+                try:
+                    registration_outcome["registration"] = service.register_export(
+                        self.settings(), "retained", "export-during-cleanup"
+                    )
+                finally:
+                    elapsed["seconds"] = time.monotonic() - started
+
+            register_thread = threading.Thread(target=do_register)
+            register_thread.start()
+            register_thread.join(timeout=10)
+
+            # Registration must complete while the unlink is still blocked,
+            # far below SQLite's 30s busy timeout.
+            self.assertIn("registration", registration_outcome)
+            self.assertLess(elapsed["seconds"], 5.0)
+
+            release_unlink.set()
+            cleanup_thread.join(timeout=15)
+
+        self.assertFalse(cleanup_thread.is_alive())
+        result = cleanup_outcome["result"]
+        self.assertEqual(result["deleted"], ["old.parquet"])
+        self.assertEqual(result["failed"], [])
+        self.assertTrue(self.exists("kept.parquet"))
+        self.assertTrue(self.exists("shared.parquet"))
+        self.assertIn("kept.parquet", result["protected_by_retained_snapshots"])
+        self.assertIn("shared.parquet", result["protected"])
+
+    def test_two_cleanup_rounds_report_deleted_and_already_absent(self) -> None:
+        """Both rounds touch the same file; exactly one reports it deleted."""
+
+        self.write_manifest([{"snapshot_id": "a", "files": ["a.parquet"]}])
+        self.touch("a.parquet")
+        service.retire_snapshot(self.settings(), "a")
+
+        barrier = threading.Barrier(2)
+        original_delete = service._delete_file
+
+        def racing_delete(data_dir: Path, relative_path: str) -> str:
+            # Both rounds have already computed "deletable"; let them race on
+            # the actual unlink.
+            barrier.wait(timeout=10)
+            return original_delete(data_dir, relative_path)
+
+        outcomes: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def do_cleanup() -> None:
+            try:
+                outcomes.append(service.run_cleanup(self.settings()))
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        with mock.patch.object(service, "_delete_file", racing_delete):
+            threads = [threading.Thread(target=do_cleanup) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(outcomes), 2)
+
+        deleted = [item for result in outcomes for item in result["deleted"]]
+        absent = [item for result in outcomes for item in result["already_absent"]]
+        failed = [item for result in outcomes for item in result["failed"]]
+        self.assertEqual(deleted, ["a.parquet"])
+        self.assertEqual(absent, ["a.parquet"])
+        self.assertEqual(failed, [])
+        self.assertFalse(self.exists("a.parquet"))
+
+    def test_deletion_failure_is_reported_and_retried_by_path(self) -> None:
+        self.write_manifest(
+            [
+                {"snapshot_id": "a", "files": ["a.parquet"]},
+                {"snapshot_id": "b", "files": ["b.parquet"]},
+            ]
+        )
+        self.touch("b.parquet")
+        # A directory at a.parquet makes unlink() fail while b.parquet is
+        # still processed successfully.
+        (self.data_dir / "a.parquet").mkdir()
+        service.retire_snapshot(self.settings(), "a")
+        service.retire_snapshot(self.settings(), "b")
+
+        first = service.run_cleanup(self.settings())
+        self.assertEqual(first["deleted"], ["b.parquet"])
+        self.assertEqual(first["failed"], ["a.parquet"])
+        self.assertEqual(first["failures"][0]["path"], "a.parquet")
+
+        second = service.run_cleanup(self.settings())
+        self.assertEqual(second["deleted"], [])
+        self.assertEqual(second["already_absent"], ["b.parquet"])
+        self.assertEqual(second["failed"], ["a.parquet"])
+
+        (self.data_dir / "a.parquet").rmdir()
+        (self.data_dir / "a.parquet").write_bytes(b"PAR1-PAR1")
+        third = service.run_cleanup(self.settings())
+        self.assertEqual(third["deleted"], ["a.parquet"])
+        self.assertEqual(third["failed"], [])
 
 
 class ManifestTests(unittest.TestCase):

@@ -78,13 +78,15 @@ def connect(path: Path) -> Iterator[sqlite3.Connection]:
 def begin_immediate(connection: sqlite3.Connection) -> None:
     """Acquire SQLite's write lock before the decision + write.
 
-    Registration, retirement, and cleanup all use this.  SQLite serializes
-    writers, so a registration either:
+    Registration and retirement both use this.  SQLite serializes writers,
+    so a registration either:
       * commits before retirement and is visible/protected to every later
         cleanup, or
       * starts after retirement has committed and is rejected.
-    There is no window in which a "successful" registration can be missed by
-    the cleanup planner.
+
+    Cleanup deliberately does *not* use this: it only needs a consistent read
+    snapshot, and holds no write lock while it deletes files.  See the module
+    docstring of ``app.service`` for why that is still safe.
     """
 
     connection.execute("BEGIN IMMEDIATE")

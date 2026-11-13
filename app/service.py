@@ -7,9 +7,18 @@ Safety rules implemented here:
 * Retirement only stops *future* registrations.  Registrations that already
   committed keep protecting their snapshot's files until they are released,
   even if retirement happens concurrently.
-* Cleanup computes the deletable set and performs unlinks while holding
-  SQLite's write lock, so a registration cannot commit in between the
-  decision and the deletion.
+* Cleanup reads retirement + registration state in one short, consistent read
+  transaction (a deferred ``BEGIN``), commits it, and only then performs the
+  filesystem unlinks.  It never holds SQLite's write lock while deleting, so
+  an exporter registering against a still-retained snapshot gets its receipt
+  immediately even when the disk is slow or a deletion hangs.
+* Deleting outside the write transaction is safe because retirement is
+  irreversible: a file is eligible only when *every* snapshot referencing it
+  has already been retired.  New registrations for a retired snapshot are
+  rejected, so no registration can start referencing an eligible file after
+  the decision.  A registration that commits concurrently either protects the
+  file (its snapshot is still retained and visible to cleanup's snapshot) or
+  is rejected (its snapshot was already retired).
 """
 
 from __future__ import annotations
@@ -334,12 +343,16 @@ def _build_plan(
         for file_path in manifest.all_files
         if file_path not in retained_files and file_path not in export_files
     ]
-    deletable = [
-        file_path for file_path in eligible if _file_present(data_dir, file_path)
-    ]
-    already_absent = [
-        file_path for file_path in eligible if not _file_present(data_dir, file_path)
-    ]
+    # Probe existence once per path.  Probing twice could put a file that
+    # disappears in between into both lists (and later report it twice as
+    # already_absent).
+    deletable: list[str] = []
+    already_absent: list[str] = []
+    for file_path in eligible:
+        if _file_present(data_dir, file_path):
+            deletable.append(file_path)
+        else:
+            already_absent.append(file_path)
     protected_by_retained = [
         file_path for file_path in manifest.all_files if file_path in retained_files
     ]
@@ -362,12 +375,17 @@ def _build_plan(
     }
 
 
-def preview_cleanup(settings: Settings) -> dict[str, Any]:
-    manifest = _manifest(settings)
+def _read_plan(settings: Settings, manifest: Manifest) -> dict[str, Any]:
+    """Take one consistent read snapshot of retirement + registration state.
+
+    A deferred ``BEGIN`` in WAL mode gives snapshot isolation for both tables
+    without taking the write lock.  The transaction is committed before the
+    caller touches the filesystem, so slow or stuck unlinks can never delay a
+    concurrent registration.
+    """
+
     ensure_db(settings.db_path)
     with connect(settings.db_path) as connection:
-        # A read transaction gives one consistent view of retirements +
-        # registrations for the preview.
         connection.execute("BEGIN")
         try:
             plan = _build_plan(connection, manifest, settings.data_dir)
@@ -376,6 +394,10 @@ def preview_cleanup(settings: Settings) -> dict[str, Any]:
             connection.rollback()
             raise
     return plan
+
+
+def preview_cleanup(settings: Settings) -> dict[str, Any]:
+    return _read_plan(settings, _manifest(settings))
 
 
 def _resolve_data_path(data_dir: Path, relative_path: str) -> Path:
@@ -397,8 +419,12 @@ def _resolve_data_path(data_dir: Path, relative_path: str) -> Path:
 def _delete_file(data_dir: Path, relative_path: str) -> str:
     """Delete one file.  Returns 'deleted' or 'absent'.
 
-    Absent files are treated as successfully reclaimed so a retried cleanup
-    after a service restart is idempotent.
+    An already-absent file (including one that disappeared between the plan
+    and the unlink, e.g. a concurrent cleanup of the same path) is reported
+    as 'absent' rather than as a failure.  Together with the pre-unlink
+    existence check this makes repeated cleanup idempotent and lets two
+    cleanup rounds that touch the same file agree: the round that removes it
+    reports ``deleted``, the other reports ``already_absent``.
     """
 
     target = _resolve_data_path(data_dir, relative_path)
@@ -406,72 +432,64 @@ def _delete_file(data_dir: Path, relative_path: str) -> str:
     # link itself, never the link target.
     if not os.path.lexists(target):
         return "absent"
-    target.unlink()
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        # Somebody else removed it between the check and the unlink.
+        return "absent"
     return "deleted"
 
 
 def run_cleanup(settings: Settings, dry_run: bool = False) -> dict[str, Any]:
     manifest = _manifest(settings)
-    ensure_db(settings.db_path)
 
-    with connect(settings.db_path) as connection:
-        # Hold the write lock across planning + unlink.  A registration that
-        # arrives meanwhile waits and then sees either protected files (still
-        # present) or a retired snapshot (and is rejected).
-        begin_immediate(connection)
+    # Decision and filesystem work are deliberately separate: the plan is
+    # taken from one consistent read transaction which is committed before
+    # the first unlink.  No SQLite write lock is held while deleting, so a
+    # concurrent registration never waits on (or fails because of) a slow
+    # disk or a deletion that cannot complete.
+    plan = _read_plan(settings, manifest)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "deleted": [],
+            "already_absent": plan["already_absent"],
+            "failed": [],
+            "failures": [],
+            "deletable": plan["deletable"],
+            "protected": plan["protected"],
+            "protected_by_retained_snapshots": plan[
+                "protected_by_retained_snapshots"
+            ],
+            "protected_by_active_exports": plan[
+                "protected_by_active_exports"
+            ],
+            "active_exports": plan["active_exports"],
+        }
+
+    deleted: list[str] = []
+    already_absent: list[str] = list(plan["already_absent"])
+    failed: list[str] = []
+    failures: list[dict[str, str]] = []
+
+    for relative_path in plan["deletable"]:
         try:
-            plan = _build_plan(connection, manifest, settings.data_dir)
-            if dry_run:
-                connection.commit()
-                return {
-                    "dry_run": True,
-                    "deleted": [],
-                    "already_absent": plan["already_absent"],
-                    "failed": [],
-                    "failures": [],
-                    "deletable": plan["deletable"],
-                    "protected": plan["protected"],
-                    "protected_by_retained_snapshots": plan[
-                        "protected_by_retained_snapshots"
-                    ],
-                    "protected_by_active_exports": plan[
-                        "protected_by_active_exports"
-                    ],
-                    "active_exports": plan["active_exports"],
-                }
+            status = _delete_file(settings.data_dir, relative_path)
+        except OSError as exc:
+            failed.append(relative_path)
+            failures.append({"path": relative_path, "error": str(exc)})
+        except ValueError as exc:
+            failed.append(relative_path)
+            failures.append({"path": relative_path, "error": str(exc)})
+        else:
+            if status == "deleted":
+                deleted.append(relative_path)
+            else:
+                already_absent.append(relative_path)
 
-            deleted: list[str] = []
-            already_absent: list[str] = list(plan["already_absent"])
-            failed: list[str] = []
-            failures: list[dict[str, str]] = []
-
-            for relative_path in plan["deletable"]:
-                try:
-                    status = _delete_file(settings.data_dir, relative_path)
-                except OSError as exc:
-                    failed.append(relative_path)
-                    failures.append(
-                        {"path": relative_path, "error": str(exc)}
-                    )
-                except ValueError as exc:
-                    failed.append(relative_path)
-                    failures.append(
-                        {"path": relative_path, "error": str(exc)}
-                    )
-                else:
-                    if status == "deleted":
-                        deleted.append(relative_path)
-                    else:
-                        already_absent.append(relative_path)
-
-            # Cleanup never changes retirement or registration state, so a
-            # partial failure simply leaves the remaining files for the next
-            # cleanup call (including after a restart).
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-
+    # Cleanup never changes retirement or registration state, so a partial
+    # failure simply leaves the remaining files for the next cleanup call
+    # (including after a restart); retrying reports them again by path.
     return {
         "dry_run": False,
         "deleted": deleted,
